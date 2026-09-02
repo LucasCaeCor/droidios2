@@ -1,0 +1,30 @@
+export type ProviderName = 'gemini' | 'openrouter' | 'ollama';
+export interface ProviderConfig { provider: ProviderName; apiKey?: string; model: string; baseUrl?: string; }
+export interface AppSettings { provider: ProviderConfig; githubToken?: string; autoApplyAgentActions: boolean; }
+export interface FileNode { name: string; path: string; kind: 'file' | 'directory'; children?: FileNode[]; }
+export interface ProjectAnalysis { projectName: string; root: string; languages: Record<string, number>; signals: string[]; androidSignals: string[]; iosBlockers: string[]; migrationScore: number; recommendedStrategy: string; filesScanned: number; }
+export type AgentAction =
+  | { id: string; type: 'write_file'; path: string; content: string; reason: string }
+  | { id: string; type: 'run_command'; command: string; cwd?: string; reason: string }
+  | { id: string; type: 'delete_file'; path: string; reason: string };
+export interface AgentResponse { message: string; actions: AgentAction[]; diagnostics?: string[]; }
+export interface GitHubRun { id: number; name: string; status: string; conclusion?: string | null; htmlUrl: string; createdAt: string; branch: string; }
+
+export interface StudioBridge {
+  dialog: { openFolder(): Promise<string | null>; chooseFolder(): Promise<string | null>; };
+  workspace: {
+    setRoot(root: string): Promise<string>; getRoot(): Promise<string | null>; tree(rel?: string, depth?: number): Promise<FileNode[]>;
+    readFile(path: string): Promise<string>; writeFile(path: string, content: string): Promise<boolean>; deleteFile(path: string): Promise<boolean>;
+    searchText(q: string): Promise<any[]>; clone(url: string, dest?: string): Promise<{root:string;stdout:string}>;
+    gitStatus(): Promise<{code:number;stdout:string;stderr:string}>; gitCommitAll(msg:string): Promise<any>; runCommand(command:string,cwd?:string):Promise<any>;
+  };
+  analysis: { run(): Promise<ProjectAnalysis>; };
+  conversion: { scaffold(): Promise<any>; };
+  settings: { get(): Promise<AppSettings>; save(s: AppSettings): Promise<AppSettings>; };
+  agent: { test(): Promise<string>; ask(params:any):Promise<AgentResponse>; applyAction(action:AgentAction):Promise<any>; };
+  terminal: { create(id:string,cwd?:string):Promise<boolean>; write(id:string,data:string):void; close(id:string):void; onData(cb:(chunk:{sessionId:string;data:string})=>void):()=>void; };
+  github: { createRepo(name:string,isPrivate:boolean,description?:string):Promise<any>; push(repoUrl:string,branch?:string):Promise<any>; dispatch(repoUrl:string,workflow?:string,ref?:string):Promise<boolean>; runs(repoUrl:string,workflow?:string):Promise<GitHubRun[]>; logs(repoUrl:string,runId:number):Promise<string>; downloadArtifact(repoUrl:string,runId:number):Promise<string|null>; };
+  system: { openExternal(url:string):Promise<void>; reveal(path:string):Promise<void>; exists(path:string):Promise<boolean>; };
+}
+
+declare global { interface Window { studio: StudioBridge; } }
