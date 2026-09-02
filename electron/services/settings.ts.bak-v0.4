@@ -29,8 +29,7 @@ const defaults: AppSettings = {
   provider: { ...providerDefaults.openrouter },
   providers: Object.values(providerDefaults).map(p => ({ ...p, fallbackModels: [...(p.fallbackModels || [])] })),
   autoApplyAgentActions: false,
-  autoFallbackAgent: true,
-  autoValidateAgentBatches: true
+  autoFallbackAgent: true
 };
 
 function settingsPath() {
@@ -123,7 +122,6 @@ export function loadSettings(): AppSettings {
       providers,
       provider: { ...primary },
       autoFallbackAgent: raw?.autoFallbackAgent ?? true,
-      autoValidateAgentBatches: raw?.autoValidateAgentBatches ?? true,
       autoApplyAgentActions: Boolean(raw?.autoApplyAgentActions),
       githubToken: decrypt(raw?.githubToken)
     };
@@ -152,8 +150,7 @@ export function saveSettings(next: AppSettings): AppSettings {
     ...next,
     provider: { ...primary },
     providers,
-    autoFallbackAgent: next.autoFallbackAgent ?? true,
-    autoValidateAgentBatches: next.autoValidateAgentBatches ?? true
+    autoFallbackAgent: next.autoFallbackAgent ?? true
   };
 
   const out = {

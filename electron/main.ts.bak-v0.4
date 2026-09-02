@@ -8,7 +8,6 @@ import * as github from './services/github';
 import { loadSettings, saveSettings } from './services/settings';
 import * as terminal from './services/terminal';
 import * as workspace from './services/workspace';
-import { scheduleValidation } from './services/validation';
 import type { AgentAction, AppSettings } from './types';
 
 let mainWindow: BrowserWindow | null = null;
@@ -71,23 +70,9 @@ ipcMain.handle('settings:save', (_e, s: AppSettings) => saveSettings(s));
 ipcMain.handle('agent:test', () => testProvider());
 ipcMain.handle('agent:ask', (_e, params) => askAgent(params));
 ipcMain.handle('agent:applyAction', async (_e, action: AgentAction) => {
-  const settings = loadSettings();
-
-  if (action.type === 'write_file') {
-    const result = workspace.writeFile(action.path, action.content);
-    if (settings.autoValidateAgentBatches) scheduleValidation();
-    return result;
-  }
-
-  if (action.type === 'delete_file') {
-    const result = workspace.deleteFile(action.path);
-    if (settings.autoValidateAgentBatches) scheduleValidation();
-    return result;
-  }
-
-  if (action.type === 'run_command') {
-    return workspace.runCommand(action.command, action.cwd || '.');
-  }
+  if (action.type === 'write_file') return workspace.writeFile(action.path, action.content);
+  if (action.type === 'delete_file') return workspace.deleteFile(action.path);
+  if (action.type === 'run_command') return workspace.runCommand(action.command, action.cwd || '.');
 });
 
 ipcMain.handle('terminal:create', (_e, id: string, cwd?: string) => terminal.createTerminal(id, cwd));

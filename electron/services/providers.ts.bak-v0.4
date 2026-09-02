@@ -7,15 +7,6 @@ export interface LlmMessage {
 
 export interface ProviderCallOptions {
   structured?: boolean;
-  preferredRoute?: { provider: ProviderName; model: string } | null;
-  blockedRoutes?: string[];
-}
-
-export interface ProviderFailure {
-  provider: ProviderName;
-  model: string;
-  retryable: boolean;
-  message: string;
 }
 
 export interface ProviderResult {
@@ -23,7 +14,6 @@ export interface ProviderResult {
   provider: ProviderName;
   model: string;
   trace: string[];
-  failures: ProviderFailure[];
 }
 
 const AGENT_RESPONSE_SCHEMA: any = {
@@ -99,11 +89,7 @@ function retryable(error: unknown) {
   ].some(token => text.includes(token));
 }
 
-function routeKey(provider: ProviderName, model: string) {
-  return `${provider}/${model}`;
-}
-
-function configuredProviders(settings: AppSettings): ProviderConfig[] {
+function configuredCandidates(settings: AppSettings): ProviderConfig[] {
   const saved = settings.providers?.length ? settings.providers : [settings.provider];
   const byName = new Map<ProviderName, ProviderConfig>();
 
@@ -114,56 +100,25 @@ function configuredProviders(settings: AppSettings): ProviderConfig[] {
   } as ProviderConfig);
 
   const primary = byName.get(settings.provider.provider) || settings.provider;
-
-  return [
+  const ordered = [
     primary,
     ...(['gemini', 'openrouter', 'ollama'] as ProviderName[])
       .filter(name => name !== primary.provider)
       .map(name => byName.get(name))
       .filter(Boolean) as ProviderConfig[]
-  ].filter((config, index) => index === 0 || (settings.autoFallbackAgent && config.enabled));
+  ];
+
+  return ordered.filter((config, index) => {
+    if (index === 0) return true;
+    return settings.autoFallbackAgent && config.enabled;
+  });
 }
 
 function modelCandidates(config: ProviderConfig): string[] {
   const values = [config.model, ...(config.fallbackModels || [])]
     .map(v => String(v || '').trim())
     .filter(Boolean);
-
   return [...new Set(values)].slice(0, 8);
-}
-
-function buildRoutes(settings: AppSettings, options: ProviderCallOptions) {
-  const blocked = new Set(options.blockedRoutes || []);
-  const routes: ProviderConfig[] = [];
-
-  for (const provider of configuredProviders(settings)) {
-    const models = settings.autoFallbackAgent ? modelCandidates(provider) : [provider.model];
-
-    for (const model of models) {
-      if (!model) continue;
-      const candidate = { ...provider, model };
-      if (!blocked.has(routeKey(candidate.provider, candidate.model))) {
-        routes.push(candidate);
-      }
-    }
-
-    if (!settings.autoFallbackAgent) break;
-  }
-
-  const preferred = options.preferredRoute;
-
-  if (preferred) {
-    const idx = routes.findIndex(
-      route => route.provider === preferred.provider && route.model === preferred.model
-    );
-
-    if (idx > 0) {
-      const [sticky] = routes.splice(idx, 1);
-      routes.unshift(sticky);
-    }
-  }
-
-  return routes;
 }
 
 export async function callProvider(
@@ -182,49 +137,41 @@ export async function callProviderWithFallback(
   options: ProviderCallOptions = {}
 ): Promise<ProviderResult> {
   const trace: string[] = [];
-  const failures: ProviderFailure[] = [];
-  const routes = buildRoutes(settings, options);
+  const providers = configuredCandidates(settings);
 
-  if (!routes.length) {
-    throw new Error(
-      'Todos os modelos disponíveis estão temporariamente bloqueados pelo circuit breaker desta tarefa.'
-    );
+  if (!providers.length) {
+    throw new Error('Nenhum provedor de IA está configurado.');
   }
 
-  for (const candidate of routes) {
-    const maxAttempts = 2;
+  for (const config of providers) {
+    const models = settings.autoFallbackAgent ? modelCandidates(config) : [config.model];
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const text = await callProvider(candidate, messages, options);
-        trace.push(`OK ${candidate.provider}/${candidate.model} na tentativa ${attempt}`);
+    for (const model of models) {
+      const candidate: ProviderConfig = { ...config, model };
+      const maxAttempts = 2;
 
-        return {
-          text,
-          provider: candidate.provider,
-          model: candidate.model,
-          trace,
-          failures
-        };
-      } catch (error) {
-        const message = errorText(error).replace(/\s+/g, ' ').slice(0, 700);
-        const canRetry = retryable(error);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const text = await callProvider(candidate, messages, options);
+          trace.push(`OK ${candidate.provider}/${candidate.model} na tentativa ${attempt}`);
+          return {
+            text,
+            provider: candidate.provider,
+            model: candidate.model,
+            trace
+          };
+        } catch (error) {
+          const message = errorText(error).replace(/\s+/g, ' ').slice(0, 700);
+          trace.push(`FALHOU ${candidate.provider}/${candidate.model} tentativa ${attempt}: ${message}`);
 
-        failures.push({
-          provider: candidate.provider,
-          model: candidate.model,
-          retryable: canRetry,
-          message
-        });
+          if (!retryable(error) || attempt === maxAttempts) break;
 
-        trace.push(
-          `FALHOU ${candidate.provider}/${candidate.model} tentativa ${attempt}: ${message}`
-        );
-
-        if (!canRetry || attempt === maxAttempts) break;
-
-        await sleep(attempt === 1 ? 900 : 1800);
+          // Backoff curto para 429/5xx. O contexto permanece exatamente igual.
+          await sleep(attempt === 1 ? 750 : 1500);
+        }
       }
+
+      if (!settings.autoFallbackAgent) break;
     }
 
     if (!settings.autoFallbackAgent) break;

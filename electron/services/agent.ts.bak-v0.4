@@ -3,11 +3,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { AgentAction, AgentResponse, ProjectAnalysis, ProviderName } from '../types';
+import type { AgentAction, AgentResponse, ProjectAnalysis } from '../types';
 import { loadSettings } from './settings';
-import { callProvider, callProviderWithFallback, type LlmMessage, type ProviderFailure } from './providers';
+import { callProvider, callProviderWithFallback, type LlmMessage } from './providers';
 import { getWorkspaceRoot, readFile, searchText, tree } from './workspace';
-import { readLastValidation } from './validation';
 
 function systemPrompt() {
   return `Você é o agente principal do Droid2iOS Studio, um engenheiro sênior especializado em Android, Kotlin, Gradle, Kotlin Multiplatform, Compose Multiplatform, Swift, SwiftUI, Xcode e CI macOS.
@@ -21,7 +20,6 @@ IMPORTANTE PARA PROJETOS GRANDES:
 - Não tente devolver dezenas de arquivos completos em uma única resposta.
 - Primeiro descubra dependências e arquivos relevantes; depois migre por domínio/feature.
 - Preserve regras de negócio. Não remova recursos apenas para fazer o build passar.
-- Se o contexto contiver uma VALIDAÇÃO AUTOMÁTICA com erro, priorize corrigir esse erro antes de criar novas funcionalidades.
 - Se ainda faltar trabalho depois da rodada atual, diga claramente no campo message qual é o próximo lote recomendado.
 Responda SOMENTE em JSON válido, sem markdown, no formato:
 {
@@ -146,20 +144,13 @@ function normalizeActions(input: any[]): AgentAction[] {
     .slice(0, 3) as AgentAction[];
 }
 
-interface StickyRoute {
-  provider: ProviderName;
-  model: string;
-}
-
 interface AgentCheckpoint {
-  version: 2;
+  version: 1;
   workspace: string;
   messageHash: string;
   pass: number;
   messages: LlmMessage[];
   providerTrace: string[];
-  stickyRoute: StickyRoute | null;
-  blockedRoutes: string[];
   updatedAt: string;
 }
 
@@ -193,21 +184,10 @@ function loadCheckpoint(messageHash: string): AgentCheckpoint | null {
   if (!file || !fs.existsSync(file)) return null;
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as any;
-    if (parsed.messageHash !== messageHash) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as AgentCheckpoint;
+    if (parsed.version !== 1 || parsed.messageHash !== messageHash) return null;
     if (!Array.isArray(parsed.messages) || !parsed.messages.length) return null;
-
-    return {
-      version: 2,
-      workspace: parsed.workspace,
-      messageHash: parsed.messageHash,
-      pass: Number(parsed.pass || 0),
-      messages: parsed.messages,
-      providerTrace: Array.isArray(parsed.providerTrace) ? parsed.providerTrace : [],
-      stickyRoute: parsed.stickyRoute || null,
-      blockedRoutes: Array.isArray(parsed.blockedRoutes) ? parsed.blockedRoutes : [],
-      updatedAt: parsed.updatedAt || new Date().toISOString()
-    };
+    return parsed;
   } catch {
     return null;
   }
@@ -223,30 +203,6 @@ function clearCheckpoint() {
   }
 }
 
-function failureRoute(failure: ProviderFailure) {
-  return `${failure.provider}/${failure.model}`;
-}
-
-function applyCircuitBreaker(
-  blockedRoutes: Set<string>,
-  failures: ProviderFailure[],
-  successfulRoute: StickyRoute
-) {
-  const counts = new Map<string, number>();
-
-  for (const failure of failures) {
-    if (!failure.retryable) continue;
-    const key = failureRoute(failure);
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-
-  for (const [key, count] of counts) {
-    if (count >= 2 && key !== `${successfulRoute.provider}/${successfulRoute.model}`) {
-      blockedRoutes.add(key);
-    }
-  }
-}
-
 export async function askAgent(params: {
   message: string;
   analysis?: ProjectAnalysis | null;
@@ -258,16 +214,7 @@ export async function askAgent(params: {
   const messageHash = taskHash(params.message);
 
   const shallowTree = tree('.', 2);
-  const lastValidation = readLastValidation();
-  const validationContext = lastValidation
-    ? `\n\nVALIDAÇÃO AUTOMÁTICA MAIS RECENTE:\n${JSON.stringify(lastValidation, null, 2).slice(0, 30000)}`
-    : '';
-
-  const context =
-    `ANÁLISE DO PROJETO:\n${JSON.stringify(params.analysis || {}, null, 2)}` +
-    `\n\nÁRVORE RESUMIDA:\n${JSON.stringify(shallowTree, null, 2)}` +
-    `\n\nARQUIVO ABERTO:\n${params.openFile ? `${params.openFile.path}\n${params.openFile.content.slice(0, 60000)}` : '(nenhum)'}` +
-    validationContext;
+  const context = `ANÁLISE DO PROJETO:\n${JSON.stringify(params.analysis || {}, null, 2)}\n\nÁRVORE RESUMIDA:\n${JSON.stringify(shallowTree, null, 2)}\n\nARQUIVO ABERTO:\n${params.openFile ? `${params.openFile.path}\n${params.openFile.content.slice(0, 60000)}` : '(nenhum)'}`;
 
   const freshMessages: LlmMessage[] = [
     { role: 'system', content: systemPrompt() },
@@ -278,8 +225,6 @@ export async function askAgent(params: {
   const saved = loadCheckpoint(messageHash);
   const messages: LlmMessage[] = saved ? saved.messages : freshMessages;
   const providerTrace: string[] = saved ? [...(saved.providerTrace || [])] : [];
-  let stickyRoute: StickyRoute | null = saved?.stickyRoute || null;
-  const blockedRoutes = new Set<string>(saved?.blockedRoutes || []);
   const startPass = saved ? Math.max(0, Math.min(saved.pass, 7)) : 0;
 
   if (saved) {
@@ -293,30 +238,17 @@ export async function askAgent(params: {
 
   for (let pass = startPass; pass < 8; pass++) {
     saveCheckpoint({
-      version: 2,
+      version: 1,
       workspace,
       messageHash,
       pass,
       messages,
       providerTrace,
-      stickyRoute,
-      blockedRoutes: [...blockedRoutes],
       updatedAt: new Date().toISOString()
     });
 
-    const result = await callProviderWithFallback(settings, messages, {
-      structured: true,
-      preferredRoute: stickyRoute,
-      blockedRoutes: [...blockedRoutes]
-    });
+    const result = await callProviderWithFallback(settings, messages, { structured: true });
     providerTrace.push(...result.trace);
-
-    stickyRoute = {
-      provider: result.provider,
-      model: result.model
-    };
-
-    applyCircuitBreaker(blockedRoutes, result.failures, stickyRoute);
 
     let parsed: any;
 
@@ -337,14 +269,12 @@ export async function askAgent(params: {
       });
 
       saveCheckpoint({
-        version: 2,
+        version: 1,
         workspace,
         messageHash,
         pass,
         messages,
         providerTrace,
-        stickyRoute,
-        blockedRoutes: [...blockedRoutes],
         updatedAt: new Date().toISOString()
       });
       continue;
@@ -358,10 +288,8 @@ export async function askAgent(params: {
       const diagnostics = [
         ...(Array.isArray(parsed.diagnostics) ? parsed.diagnostics : []),
         `Agente: ${result.provider}/${result.model}`,
-        stickyRoute ? `Sticky route da tarefa: ${stickyRoute.provider}/${stickyRoute.model}` : '',
-        blockedRoutes.size ? `Circuit breaker: ${[...blockedRoutes].join(', ')}` : '',
         ...(providerTrace.length > 1 ? [`Failover/retries: ${providerTrace.join(' | ')}`] : [])
-      ].filter(Boolean);
+      ];
 
       return {
         message: parsed.message || 'Concluído.',
@@ -393,14 +321,12 @@ export async function askAgent(params: {
     });
 
     saveCheckpoint({
-      version: 2,
+      version: 1,
       workspace,
       messageHash,
       pass: pass + 1,
       messages,
       providerTrace,
-      stickyRoute,
-      blockedRoutes: [...blockedRoutes],
       updatedAt: new Date().toISOString()
     });
   }

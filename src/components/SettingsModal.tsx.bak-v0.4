@@ -30,8 +30,7 @@ const defaults: AppSettings = {
   provider: { ...defaultsByName.openrouter },
   providers: names.map(n => ({ ...defaultsByName[n], fallbackModels: [...(defaultsByName[n].fallbackModels || [])] })),
   autoApplyAgentActions: false,
-  autoFallbackAgent: true,
-  autoValidateAgentBatches: true
+  autoFallbackAgent: true
 };
 
 function label(name: ProviderName) {
@@ -55,8 +54,7 @@ export default function SettingsModal({onClose}:{onClose:()=>void}) {
         ...defaults,
         ...saved,
         providers,
-        autoFallbackAgent: saved.autoFallbackAgent ?? true,
-        autoValidateAgentBatches: saved.autoValidateAgentBatches ?? true
+        autoFallbackAgent: saved.autoFallbackAgent ?? true
       });
     });
   },[]);
@@ -127,7 +125,7 @@ export default function SettingsModal({onClose}:{onClose:()=>void}) {
 
   return <div className="modal-backdrop"><div className="modal settings-modal">
     <div className="modal-head">
-      <div><Bot size={18}/><div><b>Configurações do agente</b><small>sticky fallback, circuit breaker, validação e GitHub</small></div></div>
+      <div><Bot size={18}/><div><b>Configurações do agente</b><small>multi-provedor, fallback automático e GitHub</small></div></div>
       <button className="icon-btn" onClick={onClose}><X size={18}/></button>
     </div>
 
@@ -199,7 +197,7 @@ export default function SettingsModal({onClose}:{onClose:()=>void}) {
       </section>
 
       <section className="form-section">
-        <h3>Resiliência do agente</h3>
+        <h3>Fallback automático</h3>
         <label className="check">
           <input
             type="checkbox"
@@ -208,19 +206,8 @@ export default function SettingsModal({onClose}:{onClose:()=>void}) {
           />
           Trocar automaticamente de modelo/provedor em 429, 5xx, timeout ou indisponibilidade
         </label>
-
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={settings.autoValidateAgentBatches}
-            onChange={e=>setSettings({...settings,autoValidateAgentBatches:e.target.checked})}
-          />
-          Validar automaticamente após lotes de alterações
-        </label>
-
         <small style={{color:'#71808d'}}>
-          O fallback que funcionar fica preferido na tarefa atual. Após duas falhas transitórias da mesma rota,
-          o circuit breaker evita insistir nela. A validação é agendada depois do último write/delete do lote.
+          O contexto da tarefa é reaproveitado integralmente. Gemini, OpenRouter e Ollama só entram no fallback quando estiverem habilitados.
         </small>
 
         <div style={{display:'grid',gap:8,marginTop:10}}>
@@ -262,14 +249,14 @@ export default function SettingsModal({onClose}:{onClose:()=>void}) {
           />
           Aplicar automaticamente alterações e comandos propostos pelo agente
         </label>
-        <small style={{color:'#71808d'}}>Se estiver ativo, a validação automática ajuda a detectar regressões logo após cada lote.</small>
+        <small style={{color:'#71808d'}}>Desativado é o modo recomendado: você revisa cada arquivo/comando antes de aplicar.</small>
       </section>
 
       <section className="security-note">
         <CheckCircle2 size={17}/>
         <div>
-          <b>Secrets, checkpoints e relatórios ficam na sua máquina.</b>
-          <p>API keys continuam protegidas pelo Electron safeStorage. Checkpoints e resultados da validação ficam no userData do Studio e não são adicionados ao projeto nem ao Git.</p>
+          <b>Secrets e checkpoints ficam na sua máquina.</b>
+          <p>API keys continuam protegidas pelo Electron safeStorage. O checkpoint do agente fica no userData do Studio e não é adicionado ao projeto nem ao Git.</p>
         </div>
       </section>
 
