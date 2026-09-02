@@ -1,4 +1,4 @@
-import type { AppSettings, ProviderConfig, ProviderName } from '../types';
+import type { ProviderConfig } from '../types';
 
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant';
@@ -7,13 +7,6 @@ export interface LlmMessage {
 
 export interface ProviderCallOptions {
   structured?: boolean;
-}
-
-export interface ProviderResult {
-  text: string;
-  provider: ProviderName;
-  model: string;
-  trace: string[];
 }
 
 const AGENT_RESPONSE_SCHEMA: any = {
@@ -58,69 +51,6 @@ const AGENT_RESPONSE_SCHEMA: any = {
   additionalProperties: false
 };
 
-function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function statusFromError(error: unknown): number | null {
-  const match = errorText(error).match(/\b(4\d\d|5\d\d)\b/);
-  return match ? Number(match[1]) : null;
-}
-
-function retryable(error: unknown) {
-  const status = statusFromError(error);
-  if (status && [429, 500, 502, 503, 504].includes(status)) return true;
-
-  const text = errorText(error).toLowerCase();
-  return [
-    'timeout',
-    'timed out',
-    'econnreset',
-    'econnrefused',
-    'fetch failed',
-    'network',
-    'temporarily unavailable',
-    'high demand',
-    'unavailable'
-  ].some(token => text.includes(token));
-}
-
-function configuredCandidates(settings: AppSettings): ProviderConfig[] {
-  const saved = settings.providers?.length ? settings.providers : [settings.provider];
-  const byName = new Map<ProviderName, ProviderConfig>();
-
-  for (const item of saved) byName.set(item.provider, item);
-  byName.set(settings.provider.provider, {
-    ...(byName.get(settings.provider.provider) || {}),
-    ...settings.provider
-  } as ProviderConfig);
-
-  const primary = byName.get(settings.provider.provider) || settings.provider;
-  const ordered = [
-    primary,
-    ...(['gemini', 'openrouter', 'ollama'] as ProviderName[])
-      .filter(name => name !== primary.provider)
-      .map(name => byName.get(name))
-      .filter(Boolean) as ProviderConfig[]
-  ];
-
-  return ordered.filter((config, index) => {
-    if (index === 0) return true;
-    return settings.autoFallbackAgent && config.enabled;
-  });
-}
-
-function modelCandidates(config: ProviderConfig): string[] {
-  const values = [config.model, ...(config.fallbackModels || [])]
-    .map(v => String(v || '').trim())
-    .filter(Boolean);
-  return [...new Set(values)].slice(0, 8);
-}
-
 export async function callProvider(
   config: ProviderConfig,
   messages: LlmMessage[],
@@ -131,68 +61,17 @@ export async function callProvider(
   return callOpenRouter(config, messages, options);
 }
 
-export async function callProviderWithFallback(
-  settings: AppSettings,
-  messages: LlmMessage[],
-  options: ProviderCallOptions = {}
-): Promise<ProviderResult> {
-  const trace: string[] = [];
-  const providers = configuredCandidates(settings);
-
-  if (!providers.length) {
-    throw new Error('Nenhum provedor de IA está configurado.');
-  }
-
-  for (const config of providers) {
-    const models = settings.autoFallbackAgent ? modelCandidates(config) : [config.model];
-
-    for (const model of models) {
-      const candidate: ProviderConfig = { ...config, model };
-      const maxAttempts = 2;
-
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const text = await callProvider(candidate, messages, options);
-          trace.push(`OK ${candidate.provider}/${candidate.model} na tentativa ${attempt}`);
-          return {
-            text,
-            provider: candidate.provider,
-            model: candidate.model,
-            trace
-          };
-        } catch (error) {
-          const message = errorText(error).replace(/\s+/g, ' ').slice(0, 700);
-          trace.push(`FALHOU ${candidate.provider}/${candidate.model} tentativa ${attempt}: ${message}`);
-
-          if (!retryable(error) || attempt === maxAttempts) break;
-
-          // Backoff curto para 429/5xx. O contexto permanece exatamente igual.
-          await sleep(attempt === 1 ? 750 : 1500);
-        }
-      }
-
-      if (!settings.autoFallbackAgent) break;
-    }
-
-    if (!settings.autoFallbackAgent) break;
-  }
-
-  throw new Error(
-    'Todos os modelos/provedores habilitados falharam. O progresso foi preservado em checkpoint local.\n' +
-    trace.join('\n')
-  );
-}
-
 async function callOpenRouter(
   config: ProviderConfig,
   messages: LlmMessage[],
   options: ProviderCallOptions
 ) {
   if (!config.apiKey) {
-    throw new Error('OpenRouter 401: informe a API key nas configurações.');
+    throw new Error('Informe a API key do OpenRouter nas configurações.');
   }
 
   const endpoint = config.baseUrl || 'https://openrouter.ai/api/v1/chat/completions';
+
   const body: any = {
     model: config.model || 'openrouter/free',
     messages,
@@ -225,6 +104,7 @@ async function callOpenRouter(
 
   if (!res.ok && options.structured && [400, 404, 422].includes(res.status)) {
     const firstError = await res.text();
+
     const fallbackBody: any = {
       model: config.model || 'openrouter/free',
       messages,
@@ -262,13 +142,15 @@ async function callOpenRouter(
 
   if (choice?.finish_reason === 'length') {
     throw new Error(
-      'OpenRouter 413: resposta interrompida por limite de saída; continue em lote menor.'
+      'OpenRouter interrompeu a resposta por limite de saída. ' +
+      'O Droid2iOS deve continuar a migração em lotes menores.'
     );
   }
 
   const content = choice?.message?.content;
+
   if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('OpenRouter 502: resposta vazia ou sem conteúdo textual.');
+    throw new Error('OpenRouter retornou uma resposta vazia ou sem conteúdo textual.');
   }
 
   return content;
@@ -280,7 +162,7 @@ async function callGemini(
   options: ProviderCallOptions
 ) {
   if (!config.apiKey) {
-    throw new Error('Gemini 401: informe a API key nas configurações.');
+    throw new Error('Informe a API key do Gemini nas configurações.');
   }
 
   const model = config.model || 'gemini-3.7-flash';
@@ -321,14 +203,17 @@ async function callGemini(
   const candidate = json.candidates?.[0];
 
   if (candidate?.finishReason === 'MAX_TOKENS') {
-    throw new Error('Gemini 413: resposta interrompida por limite de saída; continue em lote menor.');
+    throw new Error(
+      'Gemini interrompeu a resposta por limite de saída. ' +
+      'O Droid2iOS deve continuar a migração em lotes menores.'
+    );
   }
 
   const content =
     candidate?.content?.parts?.map((p: any) => p.text || '').join('') || '';
 
   if (!content.trim()) {
-    throw new Error('Gemini 502: resposta vazia.');
+    throw new Error('Gemini retornou uma resposta vazia.');
   }
 
   return content;
@@ -342,7 +227,7 @@ async function callOllama(
   const base = (config.baseUrl || 'http://localhost:11434').replace(/\/$/, '');
 
   const body: any = {
-    model: config.model || 'qwen3-coder:30b',
+    model: config.model || 'qwen2.5-coder:7b',
     messages,
     stream: false,
     options: { temperature: 0 }
@@ -350,16 +235,11 @@ async function callOllama(
 
   if (options.structured) body.format = 'json';
 
-  let res: Response;
-  try {
-    res = await fetch(`${base}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-  } catch (error) {
-    throw new Error(`Ollama 503: ${errorText(error)}`);
-  }
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
 
   if (!res.ok) {
     throw new Error(`Ollama ${res.status}: ${await res.text()}`);
@@ -368,12 +248,16 @@ async function callOllama(
   const json: any = await res.json();
 
   if (json.done_reason === 'length') {
-    throw new Error('Ollama 413: resposta interrompida por limite de saída; continue em lote menor.');
+    throw new Error(
+      'Ollama interrompeu a resposta por limite de saída. ' +
+      'O Droid2iOS deve continuar a migração em lotes menores.'
+    );
   }
 
   const content = json.message?.content || '';
+
   if (!String(content).trim()) {
-    throw new Error('Ollama 502: resposta vazia.');
+    throw new Error('Ollama retornou uma resposta vazia.');
   }
 
   return content;

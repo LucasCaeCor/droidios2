@@ -5,16 +5,12 @@ export interface ProviderConfig {
   apiKey?: string;
   model: string;
   baseUrl?: string;
-  enabled?: boolean;
-  fallbackModels?: string[];
 }
 
 export interface AppSettings {
   provider: ProviderConfig;
-  providers: ProviderConfig[];
   githubToken?: string;
   autoApplyAgentActions: boolean;
-  autoFallbackAgent: boolean;
 }
 
 export interface FileNode {

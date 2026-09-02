@@ -1,18 +1,16 @@
-import { app } from 'electron';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-
 import type { AgentAction, AgentResponse, ProjectAnalysis } from '../types';
 import { loadSettings } from './settings';
-import { callProvider, callProviderWithFallback, type LlmMessage } from './providers';
-import { getWorkspaceRoot, readFile, searchText, tree } from './workspace';
+import { callProvider, type LlmMessage } from './providers';
+import { readFile, searchText, tree } from './workspace';
 
 function systemPrompt() {
   return `Você é o agente principal do Droid2iOS Studio, um engenheiro sênior especializado em Android, Kotlin, Gradle, Kotlin Multiplatform, Compose Multiplatform, Swift, SwiftUI, Xcode e CI macOS.
+
 Objetivo: migrar apps Android para iOS preservando comportamento e evitando alterações destrutivas. Você trabalha somente no clone atual. Prefira compartilhar lógica/UI via Kotlin Multiplatform quando o app usa Kotlin + Compose. Isole APIs Android específicas em androidMain e implemente equivalentes em iosMain. Nunca finja que uma API Android funciona no iOS.
 
 Você tem contexto de árvore/arquivos. Quando precisar de mais contexto, solicite ferramentas de leitura.
+
 IMPORTANTE PARA PROJETOS GRANDES:
 - Um pedido como "converta todo o projeto" representa um objetivo de longo prazo, não uma única resposta.
 - Trabalhe incrementalmente em lotes pequenos e compiláveis.
@@ -21,6 +19,7 @@ IMPORTANTE PARA PROJETOS GRANDES:
 - Primeiro descubra dependências e arquivos relevantes; depois migre por domínio/feature.
 - Preserve regras de negócio. Não remova recursos apenas para fazer o build passar.
 - Se ainda faltar trabalho depois da rodada atual, diga claramente no campo message qual é o próximo lote recomendado.
+
 Responda SOMENTE em JSON válido, sem markdown, no formato:
 {
   "message": "explicação curta em pt-BR",
@@ -35,6 +34,7 @@ Responda SOMENTE em JSON válido, sem markdown, no formato:
   ],
   "diagnostics": ["..."]
 }
+
 Regras: use caminhos relativos; não modifique .git; não exponha secrets; não rode comandos destrutivos; para write_file sempre retorne o arquivo completo; se não houver ação, arrays vazios. O JSON precisa ser sintaticamente válido e não pode ter texto antes ou depois do objeto.`;
 }
 
@@ -126,8 +126,10 @@ function parseJson(text: string): any {
     }
   }
 
-  const detail = lastError instanceof Error ? lastError.message : 'JSON inválido';
+  const detail =
+    lastError instanceof Error ? lastError.message : 'JSON inválido';
   const preview = raw.slice(0, 1200).replace(/\s+/g, ' ');
+
   throw new Error(
     `Resposta estruturada inválida do modelo: ${detail}. ` +
     `A resposta pode ter sido truncada ou conter código não escapado. ` +
@@ -137,70 +139,9 @@ function parseJson(text: string): any {
 
 function normalizeActions(input: any[]): AgentAction[] {
   if (!Array.isArray(input)) return [];
-  return input
-    .filter(Boolean)
-    .map(a => ({ ...a, id: crypto.randomUUID() }))
-    .filter(a => ['write_file', 'delete_file', 'run_command'].includes(a.type) && (a.path || a.command))
-    .slice(0, 3) as AgentAction[];
-}
-
-interface AgentCheckpoint {
-  version: 1;
-  workspace: string;
-  messageHash: string;
-  pass: number;
-  messages: LlmMessage[];
-  providerTrace: string[];
-  updatedAt: string;
-}
-
-function checkpointKey(workspace: string) {
-  return crypto.createHash('sha256').update(workspace).digest('hex').slice(0, 24);
-}
-
-function checkpointPath() {
-  const workspace = getWorkspaceRoot();
-  if (!workspace) return null;
-  return path.join(app.getPath('userData'), 'agent-checkpoints', `${checkpointKey(workspace)}.json`);
-}
-
-function taskHash(message: string) {
-  return crypto.createHash('sha256').update(message.trim()).digest('hex');
-}
-
-function saveCheckpoint(checkpoint: AgentCheckpoint) {
-  const file = checkpointPath();
-  if (!file) return;
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(checkpoint, null, 2), 'utf8');
-  } catch {
-    // Checkpoint é proteção adicional; não interrompe o agente se falhar.
-  }
-}
-
-function loadCheckpoint(messageHash: string): AgentCheckpoint | null {
-  const file = checkpointPath();
-  if (!file || !fs.existsSync(file)) return null;
-
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as AgentCheckpoint;
-    if (parsed.version !== 1 || parsed.messageHash !== messageHash) return null;
-    if (!Array.isArray(parsed.messages) || !parsed.messages.length) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-function clearCheckpoint() {
-  const file = checkpointPath();
-  if (!file) return;
-  try {
-    fs.rmSync(file, { force: true });
-  } catch {
-    // ignore
-  }
+  return input.filter(Boolean).map(a => ({ ...a, id: crypto.randomUUID() })).filter(a =>
+    ['write_file', 'delete_file', 'run_command'].includes(a.type) && (a.path || a.command)
+  ) as AgentAction[];
 }
 
 export async function askAgent(params: {
@@ -210,55 +151,27 @@ export async function askAgent(params: {
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }): Promise<AgentResponse> {
   const settings = loadSettings();
-  const workspace = getWorkspaceRoot() || '(sem-workspace)';
-  const messageHash = taskHash(params.message);
-
   const shallowTree = tree('.', 2);
   const context = `ANÁLISE DO PROJETO:\n${JSON.stringify(params.analysis || {}, null, 2)}\n\nÁRVORE RESUMIDA:\n${JSON.stringify(shallowTree, null, 2)}\n\nARQUIVO ABERTO:\n${params.openFile ? `${params.openFile.path}\n${params.openFile.content.slice(0, 60000)}` : '(nenhum)'}`;
-
-  const freshMessages: LlmMessage[] = [
+  const messages: LlmMessage[] = [
     { role: 'system', content: systemPrompt() },
     ...(params.history || []).slice(-10).map(h => ({ role: h.role, content: h.content } as LlmMessage)),
     { role: 'user', content: `${context}\n\nPEDIDO DO USUÁRIO:\n${params.message}` }
   ];
 
-  const saved = loadCheckpoint(messageHash);
-  const messages: LlmMessage[] = saved ? saved.messages : freshMessages;
-  const providerTrace: string[] = saved ? [...(saved.providerTrace || [])] : [];
-  const startPass = saved ? Math.max(0, Math.min(saved.pass, 7)) : 0;
-
-  if (saved) {
-    messages.push({
-      role: 'user',
-      content:
-        'CHECKPOINT RESTAURADO: retome a tarefa exatamente do ponto anterior. ' +
-        'Não repita leituras já presentes no histórico salvo, a menos que sejam necessárias para validar uma alteração.'
-    });
-  }
-
-  for (let pass = startPass; pass < 8; pass++) {
-    saveCheckpoint({
-      version: 1,
-      workspace,
-      messageHash,
-      pass,
-      messages,
-      providerTrace,
-      updatedAt: new Date().toISOString()
-    });
-
-    const result = await callProviderWithFallback(settings, messages, { structured: true });
-    providerTrace.push(...result.trace);
+  for (let pass = 0; pass < 4; pass++) {
+    const raw = await callProvider(settings.provider, messages, { structured: true });
 
     let parsed: any;
 
     try {
-      parsed = parseJson(result.text);
+      parsed = parseJson(raw);
     } catch (parseError: any) {
       messages.push({
         role: 'assistant',
-        content: result.text.slice(0, 60000)
+        content: raw.slice(0, 60000)
       });
+
       messages.push({
         role: 'user',
         content:
@@ -268,92 +181,30 @@ export async function askAgent(params: {
           'Erro do parser: ' + String(parseError?.message || parseError).slice(0, 1200)
       });
 
-      saveCheckpoint({
-        version: 1,
-        workspace,
-        messageHash,
-        pass,
-        messages,
-        providerTrace,
-        updatedAt: new Date().toISOString()
-      });
       continue;
     }
-
     const toolRequests = Array.isArray(parsed.toolRequests) ? parsed.toolRequests.slice(0, 6) : [];
-
     if (!toolRequests.length) {
-      clearCheckpoint();
-
-      const diagnostics = [
-        ...(Array.isArray(parsed.diagnostics) ? parsed.diagnostics : []),
-        `Agente: ${result.provider}/${result.model}`,
-        ...(providerTrace.length > 1 ? [`Failover/retries: ${providerTrace.join(' | ')}`] : [])
-      ];
-
-      return {
-        message: parsed.message || 'Concluído.',
-        actions: normalizeActions(parsed.actions),
-        diagnostics
-      };
+      return { message: parsed.message || 'Concluído.', actions: normalizeActions(parsed.actions).slice(0, 3), diagnostics: parsed.diagnostics || [] };
     }
-
     const outputs: any[] = [];
-
     for (const req of toolRequests) {
       try {
-        if (req.type === 'read_file' && req.path) {
-          outputs.push({ request: req, result: readFile(req.path, 300_000) });
-        } else if (req.type === 'search_text' && req.query) {
-          outputs.push({ request: req, result: searchText(req.query, 60) });
-        }
-      } catch (e: any) {
-        outputs.push({ request: req, error: e.message });
-      }
+        if (req.type === 'read_file' && req.path) outputs.push({ request: req, result: readFile(req.path, 300_000) });
+        else if (req.type === 'search_text' && req.query) outputs.push({ request: req, result: searchText(req.query, 60) });
+      } catch (e: any) { outputs.push({ request: req, error: e.message }); }
     }
-
-    messages.push({ role: 'assistant', content: result.text });
-    messages.push({
-      role: 'user',
-      content:
-        `RESULTADOS DAS FERRAMENTAS:\n${JSON.stringify(outputs).slice(0, 120000)}\n` +
-        'Continue deste ponto. Responda com o JSON final ou solicite somente as leituras adicionais indispensáveis.'
-    });
-
-    saveCheckpoint({
-      version: 1,
-      workspace,
-      messageHash,
-      pass: pass + 1,
-      messages,
-      providerTrace,
-      updatedAt: new Date().toISOString()
-    });
+    messages.push({ role: 'assistant', content: raw });
+    messages.push({ role: 'user', content: `RESULTADOS DAS FERRAMENTAS:\n${JSON.stringify(outputs).slice(0, 120000)}\nAgora responda com o JSON final ou solicite mais leituras.` });
   }
-
-  throw new Error(
-    'O agente atingiu o limite de leituras desta chamada, mas o checkpoint foi salvo. ' +
-    'Envie novamente o mesmo pedido para continuar exatamente do ponto salvo.'
-  );
+  throw new Error('O agente excedeu o limite de leituras automáticas desta rodada.');
 }
 
 export async function testProvider() {
   const settings = loadSettings();
-  const configs = settings.providers?.length ? settings.providers : [settings.provider];
-  const enabled = configs.filter(c => c.provider === settings.provider.provider || c.enabled);
-  const results: string[] = [];
-
-  for (const config of enabled) {
-    try {
-      const text = await callProvider(config, [
-        { role: 'system', content: 'Responda somente com OK.' },
-        { role: 'user', content: 'Teste de conexão.' }
-      ]);
-      results.push(`${config.provider}/${config.model}: ${text.trim().slice(0, 40) || 'OK'}`);
-    } catch (error: any) {
-      results.push(`${config.provider}/${config.model}: ERRO ${String(error?.message || error).slice(0, 120)}`);
-    }
-  }
-
-  return results.join(' | ');
+  const text = await callProvider(settings.provider, [
+    { role: 'system', content: 'Responda somente com OK.' },
+    { role: 'user', content: 'Teste de conexão.' }
+  ]);
+  return text.trim().slice(0, 200);
 }
