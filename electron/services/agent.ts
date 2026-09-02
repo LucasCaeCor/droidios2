@@ -9,7 +9,18 @@ function systemPrompt() {
 
 Objetivo: migrar apps Android para iOS preservando comportamento e evitando alterações destrutivas. Você trabalha somente no clone atual. Prefira compartilhar lógica/UI via Kotlin Multiplatform quando o app usa Kotlin + Compose. Isole APIs Android específicas em androidMain e implemente equivalentes em iosMain. Nunca finja que uma API Android funciona no iOS.
 
-Você tem contexto de árvore/arquivos. Quando precisar de mais contexto, solicite ferramentas de leitura. Responda SOMENTE em JSON válido, sem markdown, no formato:
+Você tem contexto de árvore/arquivos. Quando precisar de mais contexto, solicite ferramentas de leitura.
+
+IMPORTANTE PARA PROJETOS GRANDES:
+- Um pedido como "converta todo o projeto" representa um objetivo de longo prazo, não uma única resposta.
+- Trabalhe incrementalmente em lotes pequenos e compiláveis.
+- Em cada rodada, proponha no máximo 3 ações.
+- Não tente devolver dezenas de arquivos completos em uma única resposta.
+- Primeiro descubra dependências e arquivos relevantes; depois migre por domínio/feature.
+- Preserve regras de negócio. Não remova recursos apenas para fazer o build passar.
+- Se ainda faltar trabalho depois da rodada atual, diga claramente no campo message qual é o próximo lote recomendado.
+
+Responda SOMENTE em JSON válido, sem markdown, no formato:
 {
   "message": "explicação curta em pt-BR",
   "toolRequests": [
@@ -24,15 +35,106 @@ Você tem contexto de árvore/arquivos. Quando precisar de mais contexto, solici
   "diagnostics": ["..."]
 }
 
-Regras: use caminhos relativos; não modifique .git; não exponha secrets; não rode comandos destrutivos; para write_file sempre retorne o arquivo completo; limite ações a mudanças coerentes que possam ser revisadas. Se não houver ação, arrays vazios.`;
+Regras: use caminhos relativos; não modifique .git; não exponha secrets; não rode comandos destrutivos; para write_file sempre retorne o arquivo completo; se não houver ação, arrays vazios. O JSON precisa ser sintaticamente válido e não pode ter texto antes ou depois do objeto.`;
+}
+
+function escapeRawControlCharsInsideStrings(input: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (const ch of input) {
+    if (!inString) {
+      out += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      out += ch;
+      inString = false;
+      continue;
+    }
+
+    if (ch === '\n') {
+      out += '\\n';
+      continue;
+    }
+
+    if (ch === '\r') {
+      out += '\\r';
+      continue;
+    }
+
+    if (ch === '\t') {
+      out += '\\t';
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
 }
 
 function parseJson(text: string): any {
-  const trimmed = text.trim().replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
-  try { return JSON.parse(trimmed); } catch {}
-  const start = trimmed.indexOf('{'); const end = trimmed.lastIndexOf('}');
-  if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
-  throw new Error('O modelo não retornou JSON estruturado. Tente novamente ou troque o modelo.');
+  const raw = String(text || '').trim();
+  const unfenced = raw
+    .replace(/^\s*```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim();
+
+  const candidates: string[] = [];
+  if (unfenced) candidates.push(unfenced);
+
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    const extracted = unfenced.slice(start, end + 1);
+    if (!candidates.includes(extracted)) candidates.push(extracted);
+  }
+
+  let lastError: unknown = null;
+
+  for (const candidate of candidates) {
+    const escapedControls = escapeRawControlCharsInsideStrings(candidate);
+    const attempts = [
+      candidate,
+      candidate.replace(/,\s*([}\]])/g, '$1'),
+      escapedControls,
+      escapedControls.replace(/,\s*([}\]])/g, '$1')
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        return JSON.parse(attempt);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+
+  const detail =
+    lastError instanceof Error ? lastError.message : 'JSON inválido';
+  const preview = raw.slice(0, 1200).replace(/\s+/g, ' ');
+
+  throw new Error(
+    `Resposta estruturada inválida do modelo: ${detail}. ` +
+    `A resposta pode ter sido truncada ou conter código não escapado. ` +
+    `Trecho recebido: ${preview}`
+  );
 }
 
 function normalizeActions(input: any[]): AgentAction[] {
@@ -58,21 +160,42 @@ export async function askAgent(params: {
   ];
 
   for (let pass = 0; pass < 4; pass++) {
-    const raw = await callProvider(settings.provider, messages);
-    const parsed = parseJson(raw);
-    const toolRequests = Array.isArray(parsed.toolRequests) ? parsed.toolRequests.slice(0, 8) : [];
+    const raw = await callProvider(settings.provider, messages, { structured: true });
+
+    let parsed: any;
+
+    try {
+      parsed = parseJson(raw);
+    } catch (parseError: any) {
+      messages.push({
+        role: 'assistant',
+        content: raw.slice(0, 60000)
+      });
+
+      messages.push({
+        role: 'user',
+        content:
+          'Sua resposta anterior não era JSON válido. ' +
+          'Refaça a mesma etapa em JSON válido, sem markdown, com no máximo 2 ações. ' +
+          'Se o conteúdo de um arquivo for grande demais, adie esse arquivo para a próxima rodada. ' +
+          'Erro do parser: ' + String(parseError?.message || parseError).slice(0, 1200)
+      });
+
+      continue;
+    }
+    const toolRequests = Array.isArray(parsed.toolRequests) ? parsed.toolRequests.slice(0, 6) : [];
     if (!toolRequests.length) {
-      return { message: parsed.message || 'Concluído.', actions: normalizeActions(parsed.actions), diagnostics: parsed.diagnostics || [] };
+      return { message: parsed.message || 'Concluído.', actions: normalizeActions(parsed.actions).slice(0, 3), diagnostics: parsed.diagnostics || [] };
     }
     const outputs: any[] = [];
     for (const req of toolRequests) {
       try {
-        if (req.type === 'read_file' && req.path) outputs.push({ request: req, result: readFile(req.path, 500_000) });
+        if (req.type === 'read_file' && req.path) outputs.push({ request: req, result: readFile(req.path, 300_000) });
         else if (req.type === 'search_text' && req.query) outputs.push({ request: req, result: searchText(req.query, 60) });
       } catch (e: any) { outputs.push({ request: req, error: e.message }); }
     }
     messages.push({ role: 'assistant', content: raw });
-    messages.push({ role: 'user', content: `RESULTADOS DAS FERRAMENTAS:\n${JSON.stringify(outputs).slice(0, 180000)}\nAgora responda com o JSON final ou solicite mais leituras.` });
+    messages.push({ role: 'user', content: `RESULTADOS DAS FERRAMENTAS:\n${JSON.stringify(outputs).slice(0, 120000)}\nAgora responda com o JSON final ou solicite mais leituras.` });
   }
   throw new Error('O agente excedeu o limite de leituras automáticas desta rodada.');
 }
