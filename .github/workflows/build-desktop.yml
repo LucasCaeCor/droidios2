@@ -3,41 +3,93 @@ name: Build Droid2iOS Studio
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches:
+      - main
+    tags:
+      - 'v*'
   pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build-windows:
+    name: Windows
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
-          cache: npm
-      - run: npm install --no-audit --no-fund
-      - run: npm run typecheck
-      - run: npm run dist:win
-      - uses: actions/upload-artifact@v4
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: TypeScript check
+        run: npm run typecheck
+
+      - name: Build Windows
+        run: npm run dist:win
+
+      - name: List generated files
+        shell: pwsh
+        run: |
+          Write-Host "=== RELEASE ==="
+          if (Test-Path release) {
+            Get-ChildItem release -Recurse | Select-Object FullName, Length
+          } else {
+            Write-Error "Pasta release nao foi criada."
+          }
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
         with:
           name: Droid2iOS-Studio-Windows
           path: release/*
+          if-no-files-found: error
           retention-days: 14
 
   build-linux:
+    name: Linux
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
-          cache: npm
-      - run: npm install --no-audit --no-fund
-      - run: npm run build
-      - run: npm run dist:linux
-      - uses: actions/upload-artifact@v4
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: TypeScript check
+        run: npm run typecheck
+
+      - name: Build Linux
+        run: npm run dist:linux
+
+      - name: List generated files
+        run: |
+          echo "=== RELEASE ==="
+          find release -maxdepth 2 -type f -print || true
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v7
         with:
           name: Droid2iOS-Studio-Linux
           path: release/*
+          if-no-files-found: error
           retention-days: 14
